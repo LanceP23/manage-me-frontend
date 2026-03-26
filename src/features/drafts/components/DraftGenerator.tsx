@@ -24,6 +24,7 @@ const sources = [
 const triageModes = [
   { value: "hybrid", label: "Hybrid AI" },
   { value: "heuristic", label: "Heuristic" },
+  { value: "ai_only", label: "AI Only" },
 ];
 
 type DraftGeneratorProps = {
@@ -197,7 +198,7 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
   const [context, setContext] = useState("");
   const [productArea, setProductArea] = useState("");
   const [environment, setEnvironment] = useState("production");
-  const [analysisMode, setAnalysisMode] = useState<"heuristic" | "hybrid">("hybrid");
+  const [analysisMode, setAnalysisMode] = useState<"heuristic" | "hybrid" | "ai_only">("hybrid");
   const [source, setSource] = useState("chat");
   const [maxDrafts, setMaxDrafts] = useState(3);
   const [candidateOwners, setCandidateOwners] = useState<CandidateOwnerDraft[]>([]);
@@ -573,7 +574,9 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
               label="Analysis mode"
               value={analysisMode}
               onChange={(event) =>
-                setAnalysisMode(event.target.value as "heuristic" | "hybrid")
+                setAnalysisMode(
+                  event.target.value as "heuristic" | "hybrid" | "ai_only",
+                )
               }
               options={triageModes}
             />
@@ -708,10 +711,16 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
                 Highest {analysis.summary.highestPriority}
               </span>
               <span className="rounded-full border border-[var(--mm-border)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
-                {analysis.summary.mode === "hybrid" ? "Hybrid mode" : "Heuristic mode"}
+                {analysis.summary.mode === "hybrid"
+                  ? "Hybrid mode"
+                  : analysis.summary.mode === "ai_only"
+                    ? "AI-only mode"
+                    : "Heuristic mode"}
               </span>
               <span className="rounded-full border border-[var(--mm-border)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
-                {analysis.summary.reasoningSource === "llm_rewritten"
+                {analysis.summary.reasoningSource === "ai_full"
+                  ? "AI decision"
+                  : analysis.summary.reasoningSource === "llm_rewritten"
                   ? "LLM reasoning"
                   : analysis.summary.reasoningSource === "heuristic_fallback"
                     ? "Heuristic fallback"

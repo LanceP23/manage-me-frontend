@@ -38,7 +38,7 @@ export type TicketTriageRequest = {
   rawReports: string[];
   pastTickets?: TicketTriagePastTicket[];
   candidateOwners?: TicketTriageCandidateOwner[];
-  mode?: "heuristic" | "hybrid";
+  mode?: "heuristic" | "hybrid" | "ai_only";
   context?: {
     productArea?: string;
     environment?: string;
@@ -81,8 +81,12 @@ export type TicketTriageResponse = {
   summary: {
     reportCount: number;
     highestPriority: "low" | "medium" | "high";
-    mode: "heuristic" | "hybrid";
-    reasoningSource: "heuristic" | "llm_rewritten" | "heuristic_fallback";
+    mode: "heuristic" | "hybrid" | "ai_only";
+    reasoningSource:
+      | "heuristic"
+      | "llm_rewritten"
+      | "heuristic_fallback"
+      | "ai_full";
   };
   recommendations: TicketTriageRecommendation[];
 };
