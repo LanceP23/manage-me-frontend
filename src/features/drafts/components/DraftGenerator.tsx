@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState } from "react";
 import { generateDrafts, type Draft } from "@/shared/api/drafts";
 import {
   analyzeTicketTriage,
-  getTickets,
   type TicketTriageResponse,
 } from "@/shared/api/tickets";
 import { listOrganizationMembers } from "@/shared/api/organizations";
@@ -12,8 +11,8 @@ import { useAuth } from "@/features/auth/store/useAuth";
 import Button from "@/shared/ui/Button";
 import Input from "@/shared/ui/Input";
 import Select from "@/shared/ui/Select";
-import StatusBadge from "@/shared/ui/StatusBadge";
 import Textarea from "@/shared/ui/Textarea";
+import { useToast } from "@/shared/ui/toast";
 
 const sources = [
   { value: "chat", label: "Chat" },
@@ -22,18 +21,13 @@ const sources = [
   { value: "manual", label: "Manual" },
 ];
 
+const triageModes = [
+  { value: "hybrid", label: "Hybrid AI" },
+  { value: "heuristic", label: "Heuristic" },
+];
+
 type DraftGeneratorProps = {
   onGenerated?: (createdDraftIds?: string[]) => void;
-};
-
-type HistoricalTicketDraft = {
-  id: string;
-  title: string;
-  description: string;
-  priority: string;
-  status: string;
-  ownerHint: string;
-  enabled: boolean;
 };
 
 type CandidateOwnerDraft = {
@@ -42,47 +36,102 @@ type CandidateOwnerDraft = {
   role: string;
   skillsText: string;
   email?: string;
-  source: "org" | "demo";
+  source: "org";
 };
 
-const DEMO_SPECIALISTS: CandidateOwnerDraft[] = [
-  {
-    id: "demo-backend-specialist",
-    name: "Backend Specialist",
-    role: "backend",
-    skillsText: "api, authentication, server, payments",
-    source: "demo",
-  },
-  {
-    id: "demo-frontend-specialist",
-    name: "Frontend Specialist",
-    role: "frontend",
-    skillsText: "ui, forms, admin ui, dashboard",
-    source: "demo",
-  },
-  {
-    id: "demo-mobile-specialist",
-    name: "Mobile Specialist",
-    role: "mobile",
-    skillsText: "ios, android, login, auth",
-    source: "demo",
-  },
-];
-
-function buildInitialOwnerRole(role: string) {
+function inferOwnerProfile(role: string, name: string, email?: string) {
   const normalized = role.trim().toLowerCase();
-  if (normalized === "owner" || normalized === "admin") {
-    return "operations";
+  const hint = `${name} ${email ?? ""}`.trim().toLowerCase();
+
+  if (hint.includes("backend")) {
+    return {
+      role: "backend",
+      skillsText: "api, authentication, server, payments",
+    };
   }
-  return normalized || "member";
+  if (hint.includes("frontend")) {
+    return {
+      role: "frontend",
+      skillsText: "ui, forms, admin ui, dashboard",
+    };
+  }
+  if (hint.includes("mobile")) {
+    return {
+      role: "mobile",
+      skillsText: "ios, android, login, auth",
+    };
+  }
+  if (normalized === "owner" || normalized === "admin") {
+    return {
+      role: "operations",
+      skillsText: "triage, operations",
+    };
+  }
+  return {
+    role: normalized || "member",
+    skillsText: "",
+  };
 }
 
-function buildInitialOwnerSkills(role: string) {
-  const normalized = role.trim().toLowerCase();
-  if (normalized === "owner" || normalized === "admin") {
-    return "triage, operations";
+function buildOwnerDraft(
+  id: string,
+  name: string,
+  memberRole: string,
+  email?: string,
+): CandidateOwnerDraft {
+  const profile = inferOwnerProfile(memberRole, name, email);
+  return {
+    id,
+    name,
+    role: profile.role,
+    skillsText: profile.skillsText,
+    email,
+    source: "org",
+  };
+}
+
+function dedupeOwnerDrafts(owners: CandidateOwnerDraft[]) {
+  const seen = new Set<string>();
+  return owners.filter((owner) => {
+    const key = owner.email?.toLowerCase() || owner.id;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildFallbackOwner(user: {
+  id: string;
+  firstName?: string | null;
+  lastName?: string | null;
+  email: string;
+}): CandidateOwnerDraft {
+  const name = `${user.firstName ?? ""} ${user.lastName ?? ""}`.trim() || user.email;
+  return {
+    id: user.id,
+    name,
+    role: "operations",
+    skillsText: "triage, operations",
+    email: user.email,
+    source: "org",
+  };
+}
+
+function describeOwnerPool(owners: CandidateOwnerDraft[]) {
+  const specialistCount = owners.filter((owner) => {
+    const normalizedRole = owner.role.trim().toLowerCase();
+    return ["backend", "frontend", "mobile"].includes(normalizedRole);
+  }).length;
+
+  if (specialistCount >= 3) {
+    return "Seeded specialists are available from your real org members and can still be edited before analysis.";
   }
-  return "";
+  if (owners.length > 1) {
+    return "Candidate owners come from your organization membership and can be adjusted before analysis.";
+  }
+  return "Only a small owner roster is available right now. Re-run org seeding if you want dedicated backend, frontend, and mobile specialists.";
 }
 
 function priorityBadgeClass(priority: string) {
@@ -137,20 +186,23 @@ function recommendedActionLabel(
   }
 }
 
+function insightPreview(reasons?: string[]) {
+  return reasons?.[0] ?? "No supporting detail was generated.";
+}
+
 export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
   const { token, orgId, ready, user } = useAuth();
+  const { pushToast } = useToast();
   const [rawInput, setRawInput] = useState("");
   const [context, setContext] = useState("");
   const [productArea, setProductArea] = useState("");
   const [environment, setEnvironment] = useState("production");
+  const [analysisMode, setAnalysisMode] = useState<"heuristic" | "hybrid">("hybrid");
   const [source, setSource] = useState("chat");
   const [maxDrafts, setMaxDrafts] = useState(3);
-  const [historicalTickets, setHistoricalTickets] = useState<HistoricalTicketDraft[]>([]);
   const [candidateOwners, setCandidateOwners] = useState<CandidateOwnerDraft[]>([]);
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [setupView, setSetupView] = useState<"history" | "owners">("history");
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<TicketTriageResponse | null>(null);
   const [analysisKey, setAnalysisKey] = useState<string | null>(null);
   const [draftGeneratedKey, setDraftGeneratedKey] = useState<string | null>(null);
@@ -165,73 +217,38 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
     let isMounted = true;
     setIsLoadingContext(true);
 
-    Promise.allSettled([
-      getTickets(token, orgId),
-      listOrganizationMembers(token, orgId, orgId),
-    ])
+    Promise.allSettled([listOrganizationMembers(token, orgId, orgId)])
       .then((responses) => {
         if (!isMounted) return;
 
-        const ticketsResponse = responses[0];
-        if (ticketsResponse.status === "fulfilled") {
-          const recentTickets = (ticketsResponse.value.data ?? [])
-            .slice(0, 6)
-            .map((ticket) => ({
-              id: String(ticket.id),
-              title: ticket.title,
-              description: ticket.description ?? "",
-              priority: ticket.priority ?? "medium",
-              status: ticket.status,
-              ownerHint: "",
-              enabled: true,
-            }));
-          setHistoricalTickets(recentTickets);
-        }
-
-        const membersResponse = responses[1];
+        const membersResponse = responses[0];
         if (membersResponse.status === "fulfilled") {
-          const memberOwners = membersResponse.value
-            .filter((member) => member.user)
-            .map((member) => ({
-              id: member.user?.id ?? member.id,
-              name:
-                `${member.user?.firstName ?? ""} ${member.user?.lastName ?? ""}`.trim() ||
-                member.user?.email ||
-                "Team Member",
-              role: buildInitialOwnerRole(member.role),
-              skillsText: buildInitialOwnerSkills(member.role),
-              email: member.user?.email,
-              source: "org" as const,
-            }));
+          const memberOwners = dedupeOwnerDrafts(
+            membersResponse.value
+              .filter((member) => member.user)
+              .map((member) => {
+                const name =
+                  `${member.user?.firstName ?? ""} ${member.user?.lastName ?? ""}`.trim() ||
+                  member.user?.email ||
+                  "Team Member";
+                return buildOwnerDraft(
+                  member.user?.id ?? member.id,
+                  name,
+                  member.role,
+                  member.user?.email,
+                );
+              }),
+          );
 
           setCandidateOwners(
             memberOwners.length
               ? memberOwners
               : user
-                ? [
-                    {
-                      id: user.id,
-                      name:
-                        `${user.firstName} ${user.lastName}`.trim() || user.email,
-                      role: "operations",
-                      skillsText: "triage, operations",
-                      email: user.email,
-                      source: "org",
-                    },
-                  ]
+                ? [buildFallbackOwner(user)]
                 : [],
           );
         } else if (user) {
-          setCandidateOwners([
-            {
-              id: user.id,
-              name: `${user.firstName} ${user.lastName}`.trim() || user.email,
-              role: "operations",
-              skillsText: "triage, operations",
-              email: user.email,
-              source: "org",
-            },
-          ]);
+          setCandidateOwners([buildFallbackOwner(user)]);
         }
       })
       .finally(() => {
@@ -254,11 +271,6 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
     [rawInput],
   );
 
-  const enabledMemoryCount = useMemo(
-    () => historicalTickets.filter((ticket) => ticket.enabled).length,
-    [historicalTickets],
-  );
-
   const advancedContext = useMemo(() => {
     const parts = [
       context.trim(),
@@ -275,16 +287,16 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
         context,
         productArea,
         environment,
+        analysisMode,
         source,
         maxDrafts,
-        historicalTickets,
         candidateOwners,
       }),
     [
       candidateOwners,
+      analysisMode,
       context,
       environment,
-      historicalTickets,
       maxDrafts,
       productArea,
       rawInput,
@@ -307,6 +319,7 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
             context: context.trim() || undefined,
             productArea: productArea.trim() || undefined,
             environment: environment.trim() || undefined,
+            analysisMode,
             source,
           },
         }
@@ -326,18 +339,6 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
     setDuplicateOverrideAccepted(false);
   }, [analysisKey, currentInputKey]);
 
-  const updateHistoricalTicket = (
-    id: string,
-    field: "enabled" | "ownerHint",
-    value: boolean | string,
-  ) => {
-    setHistoricalTickets((current) =>
-      current.map((ticket) =>
-        ticket.id === id ? { ...ticket, [field]: value } : ticket,
-      ),
-    );
-  };
-
   const updateCandidateOwner = (
     id: string,
     field: "role" | "skillsText",
@@ -350,32 +351,13 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
     );
   };
 
-  const addDemoSpecialists = () => {
-    setCandidateOwners((current) => {
-      const existingIds = new Set(current.map((owner) => owner.id));
-      const next = [...current];
-      for (const owner of DEMO_SPECIALISTS) {
-        if (!existingIds.has(owner.id)) {
-          next.push(owner);
-        }
-      }
-      return next;
-    });
-  };
-
-  const resetOwnersToOrgMembers = () => {
-    setCandidateOwners((current) =>
-      current.filter((owner) => owner.source === "org"),
-    );
-  };
-
-  const removeCandidateOwner = (id: string) => {
-    setCandidateOwners((current) => current.filter((owner) => owner.id !== id));
-  };
-
   const onAnalyze = async () => {
     if (!token || !orgId) {
-      setError("Missing organization context. Please log in again.");
+      pushToast({
+        title: "Missing organization context",
+        description: "Log in again before analyzing issue intake.",
+        tone: "error",
+      });
       return;
     }
 
@@ -385,27 +367,20 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
       .filter(Boolean);
 
     if (!reports.length) {
-      setError("Add at least one issue report to analyze.");
+      pushToast({
+        title: "Nothing to analyze",
+        description: "Add at least one issue report before running decision support.",
+        tone: "error",
+      });
       return;
     }
 
     setIsAnalyzing(true);
     setError(null);
-    setNotice(null);
-
     try {
       const response = await analyzeTicketTriage(token, orgId, {
         rawReports: reports,
-        pastTickets: historicalTickets
-          .filter((ticket) => ticket.enabled)
-          .map((ticket) => ({
-            id: ticket.id,
-            title: ticket.title,
-            description: ticket.description || undefined,
-            priority: ticket.priority || undefined,
-            status: ticket.status || undefined,
-            ownerHint: ticket.ownerHint.trim() || undefined,
-          })),
+        mode: analysisMode,
         candidateOwners: candidateOwners.map((owner) => ({
           id: owner.id,
           name: owner.name,
@@ -428,7 +403,11 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed to analyze issues.";
-      setError(message);
+      pushToast({
+        title: "Analysis failed",
+        description: message,
+        tone: "error",
+      });
     } finally {
       setIsAnalyzing(false);
     }
@@ -437,25 +416,40 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
   const onSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!token || !orgId) {
-      setError("Missing organization context. Please log in again.");
+      pushToast({
+        title: "Missing organization context",
+        description: "Log in again before generating drafts.",
+        tone: "error",
+      });
       return;
     }
     if (!rawInput.trim()) {
-      setError("Please enter input for the AI to analyze.");
+      pushToast({
+        title: "Issue intake is empty",
+        description: "Paste issue notes before generating drafts.",
+        tone: "error",
+      });
       return;
     }
     if (!analysisReady) {
-      setError("Analyze the intake first so the draft is generated from a reviewed decision.");
+      pushToast({
+        title: "Analyze before drafting",
+        description: "Run decision support first so the draft is generated from a reviewed recommendation.",
+        tone: "error",
+      });
       return;
     }
     if (blockingDuplicateRecommendation && !duplicateOverrideAccepted) {
-      setError("This intake strongly matches an existing ticket. Review the recommendation or explicitly acknowledge creating a duplicate draft.");
+      pushToast({
+        title: "Duplicate risk is high",
+        description: "Review the recommended existing ticket or explicitly acknowledge the override.",
+        tone: "error",
+      });
       return;
     }
 
     setIsGenerating(true);
     setError(null);
-    setNotice(null);
 
     try {
       const response = await generateDrafts(
@@ -472,13 +466,22 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
       const createdDrafts: Draft[] = Array.isArray(response)
         ? response
         : response.data ?? [];
-      setNotice("Drafts generated. Review the queue below and compare them against the decision support output.");
+      pushToast({
+        title: "Drafts generated",
+        description:
+          "Review the queue below and compare the drafts against the decision support output.",
+        tone: "success",
+      });
       setDraftGeneratedKey(currentInputKey);
       onGenerated?.(createdDrafts.map((draft) => String(draft.id)));
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed to generate drafts.";
-      setError(message);
+      pushToast({
+        title: "Draft generation failed",
+        description: message,
+        tone: "error",
+      });
     } finally {
       setIsGenerating(false);
     }
@@ -514,9 +517,6 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
         <div className="mt-4 flex flex-wrap gap-2">
           <span className="rounded-full border border-[var(--mm-border)] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
             {reportCount} report{reportCount === 1 ? "" : "s"}
-          </span>
-          <span className="rounded-full border border-[var(--mm-border)] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
-            {enabledMemoryCount} memory ticket{enabledMemoryCount === 1 ? "" : "s"}
           </span>
           <span className="rounded-full border border-[var(--mm-border)] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
             {candidateOwners.length} owner candidate{candidateOwners.length === 1 ? "" : "s"}
@@ -562,12 +562,20 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
             value={context}
             onChange={(event) => setContext(event.target.value)}
           />
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_120px]">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             <Select
               label="Source"
               value={source}
               onChange={(event) => setSource(event.target.value)}
               options={sources}
+            />
+            <Select
+              label="Analysis mode"
+              value={analysisMode}
+              onChange={(event) =>
+                setAnalysisMode(event.target.value as "heuristic" | "hybrid")
+              }
+              options={triageModes}
             />
             <Input
               label="Max drafts"
@@ -598,158 +606,56 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
               />
             </div>
 
-            <div className="mt-4 flex flex-wrap gap-2 text-xs">
-              <button
-                type="button"
-                onClick={() => setSetupView("history")}
-                className={
-                  setupView === "history"
-                    ? "mm-pill"
-                    : "rounded-full border border-[var(--mm-border)] px-3 py-1.5 text-[var(--mm-mist)] transition hover:border-[var(--mm-border-strong)] hover:text-[var(--mm-bone)]"
-                }
-              >
-                Historical Memory ({enabledMemoryCount})
-              </button>
-              <button
-                type="button"
-                onClick={() => setSetupView("owners")}
-                className={
-                  setupView === "owners"
-                    ? "mm-pill"
-                    : "rounded-full border border-[var(--mm-border)] px-3 py-1.5 text-[var(--mm-mist)] transition hover:border-[var(--mm-border-strong)] hover:text-[var(--mm-bone)]"
-                }
-              >
-                Candidate Owners ({candidateOwners.length})
-              </button>
+            <div className="mt-4 rounded-xl border border-[var(--mm-border)] bg-[rgba(8,11,18,0.42)] px-4 py-3 text-xs text-[var(--mm-mist)]">
+              Historical ticket memory is pulled automatically from your organization in the backend. Only owner routing stays editable here.
             </div>
 
-            {setupView === "history" ? (
-              <div className="mt-4 flex flex-col gap-3">
-                {isLoadingContext ? (
-                  <div className="rounded-xl border border-[var(--mm-border)] bg-[rgba(255,255,255,0.02)] px-4 py-3 text-xs text-[var(--mm-mist)]">
-                    Loading recent tickets...
-                  </div>
-                ) : null}
-                {historicalTickets.length === 0 ? (
-                  <div className="rounded-xl border border-[var(--mm-border)] bg-[rgba(255,255,255,0.02)] px-4 py-3 text-xs text-[var(--mm-mist)]">
-                    No recent tickets available. Continue with the intake alone or seed more history for stronger matching.
-                  </div>
-                ) : null}
-                {historicalTickets.map((ticket) => (
-                  <div
-                    key={ticket.id}
-                    className="rounded-xl border border-[var(--mm-border)] bg-[rgba(8,11,18,0.42)] p-3"
-                  >
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <label className="flex items-start gap-3">
-                        <input
-                          type="checkbox"
-                          checked={ticket.enabled}
-                          onChange={(event) =>
-                            updateHistoricalTicket(ticket.id, "enabled", event.target.checked)
-                          }
-                          className="mt-1 h-4 w-4 rounded border-[var(--mm-border)] bg-transparent"
-                        />
-                        <div>
-                          <p className="font-medium text-[var(--mm-bone)]">{ticket.title}</p>
-                          <p className="mt-1 text-xs text-[var(--mm-mist)]">Ticket #{ticket.id}</p>
-                        </div>
-                      </label>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <StatusBadge status={ticket.status} />
-                        <span
-                          className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] ${priorityBadgeClass(ticket.priority)}`}
-                        >
-                          {ticket.priority}
-                        </span>
-                      </div>
-                    </div>
-                    {ticket.description ? (
-                      <p className="mt-3 text-xs text-[var(--mm-mist)]">{ticket.description}</p>
-                    ) : null}
-                    <div className="mt-3">
-                      <Input
-                        label="Owner hint (optional)"
-                        placeholder="backend, mobile, frontend..."
-                        value={ticket.ownerHint}
-                        onChange={(event) =>
-                          updateHistoricalTicket(ticket.id, "ownerHint", event.target.value)
-                        }
-                      />
-                    </div>
-                  </div>
-                ))}
+            <div className="mt-4 flex flex-col gap-3">
+              <div className="rounded-xl border border-[var(--mm-border)] bg-[rgba(255,255,255,0.02)] px-4 py-3 text-xs text-[var(--mm-mist)]">
+                {describeOwnerPool(candidateOwners)}
               </div>
-            ) : (
-              <div className="mt-4 flex flex-col gap-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <p className="text-xs text-[var(--mm-mist)]">
-                    Org members load automatically. Add demo specialists only when you need stronger routing choices for the demo.
-                  </p>
-                  <div className="flex flex-wrap gap-2">
-                    <Button
-                      label="Add Demo Specialists"
-                      type="button"
-                      variant="ghost"
-                      className="px-3 py-1.5 text-xs"
-                      onClick={addDemoSpecialists}
+              {isLoadingContext ? (
+                <div className="rounded-xl border border-[var(--mm-border)] bg-[rgba(255,255,255,0.02)] px-4 py-3 text-xs text-[var(--mm-mist)]">
+                  Loading candidate owners...
+                </div>
+              ) : null}
+              {candidateOwners.map((owner) => (
+                <div
+                  key={owner.id}
+                  className="rounded-xl border border-[var(--mm-border)] bg-[rgba(8,11,18,0.42)] p-3"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="font-medium text-[var(--mm-bone)]">{owner.name}</p>
+                      <p className="mt-1 text-xs text-[var(--mm-mist)]">{owner.email ?? owner.id}</p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="rounded-full border border-[var(--mm-border)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
+                        Org
+                      </span>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                    <Input
+                      label="Role"
+                      placeholder="backend, frontend, mobile..."
+                      value={owner.role}
+                      onChange={(event) =>
+                        updateCandidateOwner(owner.id, "role", event.target.value)
+                      }
                     />
-                    <Button
-                      label="Reset Demo Owners"
-                      type="button"
-                      variant="dark"
-                      className="px-3 py-1.5 text-xs"
-                      onClick={resetOwnersToOrgMembers}
+                    <Input
+                      label="Skills"
+                      placeholder="api, payments, auth"
+                      value={owner.skillsText}
+                      onChange={(event) =>
+                        updateCandidateOwner(owner.id, "skillsText", event.target.value)
+                      }
                     />
                   </div>
                 </div>
-                {candidateOwners.map((owner) => (
-                  <div
-                    key={owner.id}
-                    className="rounded-xl border border-[var(--mm-border)] bg-[rgba(8,11,18,0.42)] p-3"
-                  >
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div>
-                        <p className="font-medium text-[var(--mm-bone)]">{owner.name}</p>
-                        <p className="mt-1 text-xs text-[var(--mm-mist)]">{owner.email ?? owner.id}</p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="rounded-full border border-[var(--mm-border)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
-                          {owner.source === "org" ? "Org" : "Demo"}
-                        </span>
-                        {owner.source === "demo" ? (
-                          <Button
-                            label="Remove"
-                            type="button"
-                            variant="ghost"
-                            className="px-2.5 py-1 text-[10px]"
-                            onClick={() => removeCandidateOwner(owner.id)}
-                          />
-                        ) : null}
-                      </div>
-                    </div>
-                    <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                      <Input
-                        label="Role"
-                        placeholder="backend, frontend, mobile..."
-                        value={owner.role}
-                        onChange={(event) =>
-                          updateCandidateOwner(owner.id, "role", event.target.value)
-                        }
-                      />
-                      <Input
-                        label="Skills"
-                        placeholder="api, payments, auth"
-                        value={owner.skillsText}
-                        onChange={(event) =>
-                          updateCandidateOwner(owner.id, "skillsText", event.target.value)
-                        }
-                      />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
+              ))}
+            </div>
           </div>
         ) : null}
       </section>
@@ -759,12 +665,6 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
           {error}
         </div>
       ) : null}
-      {notice ? (
-        <div className="rounded-xl border border-[var(--mm-border)] bg-[rgba(89,219,181,0.08)] px-4 py-3 text-xs text-[#9ff4de]">
-          {notice}
-        </div>
-      ) : null}
-
       <section className="rounded-xl border border-[var(--mm-border)] bg-[rgba(8,11,18,0.42)] p-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
@@ -808,6 +708,16 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
                 Highest {analysis.summary.highestPriority}
               </span>
               <span className="rounded-full border border-[var(--mm-border)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
+                {analysis.summary.mode === "hybrid" ? "Hybrid mode" : "Heuristic mode"}
+              </span>
+              <span className="rounded-full border border-[var(--mm-border)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
+                {analysis.summary.reasoningSource === "llm_rewritten"
+                  ? "LLM reasoning"
+                  : analysis.summary.reasoningSource === "heuristic_fallback"
+                    ? "Heuristic fallback"
+                    : "Heuristic reasoning"}
+              </span>
+              <span className="rounded-full border border-[var(--mm-border)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
                 {analysis.summary.reportCount} report{analysis.summary.reportCount === 1 ? "" : "s"}
               </span>
             </div>
@@ -815,119 +725,160 @@ export default function DraftGenerator({ onGenerated }: DraftGeneratorProps) {
             {analysis.recommendations.map((recommendation, index) => (
               <div
                 key={`${recommendation.rawReport}-${index}`}
-                className="rounded-xl border border-[var(--mm-border)] bg-[rgba(255,255,255,0.02)] p-4"
+                className="rounded-2xl border border-[var(--mm-border)] bg-[rgba(255,255,255,0.02)] p-4"
               >
                 <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-semibold text-[var(--mm-bone)]">
-                      {recommendation.rawReport}
-                    </p>
-                    <p className="mt-1 text-xs text-[var(--mm-mist)]">
-                      Confidence {(recommendation.confidence * 100).toFixed(0)}%
-                    </p>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span
-                      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] ${priorityBadgeClass(recommendation.priority)}`}
-                    >
-                      {recommendation.priority} priority
-                    </span>
-                    <span
-                      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] ${effortBadgeClass(recommendation.effortEstimate)}`}
-                    >
-                      {recommendation.effortEstimate} effort
-                    </span>
-                  </div>
-                </div>
-
-                <div className="mt-4 grid gap-4 lg:grid-cols-[1.1fr_1fr_1fr]">
-                  <div className="rounded-xl border border-[var(--mm-border)] bg-[rgba(8,11,18,0.42)] p-3 lg:col-span-3">
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div>
-                        <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
-                          Recommended next move
-                        </p>
-                        <p className="mt-2 text-sm font-semibold text-[var(--mm-bone)]">
-                          {recommendedActionLabel(recommendation.recommendedAction)}
-                          {recommendation.recommendedTargetTicket?.id
-                            ? ` with #${recommendation.recommendedTargetTicket.id}`
-                            : ""}
-                        </p>
-                        {recommendation.recommendedTargetTicket ? (
-                          <p className="mt-1 text-xs text-[var(--mm-mist)]">
-                            {recommendation.recommendedTargetTicket.title}
-                            {recommendation.recommendedTargetTicket.status
-                              ? ` • ${recommendation.recommendedTargetTicket.status}`
-                              : ""}
-                          </p>
-                        ) : null}
-                      </div>
-                      <span
-                        className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] ${duplicateRiskBadgeClass(recommendation.duplicateRisk)}`}
-                      >
-                        {recommendation.duplicateRisk} duplicate risk
-                      </span>
-                    </div>
-                    <div className="mt-3 flex flex-col gap-2 text-sm text-[var(--mm-mist)]">
-                      {recommendation.recommendedActionReasoning.map((reason) => (
-                        <p key={reason}>- {reason}</p>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="rounded-xl border border-[var(--mm-border)] bg-[rgba(8,11,18,0.42)] p-3">
-                    <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
-                      Priority reasoning
-                    </p>
-                    <div className="mt-2 flex flex-col gap-2 text-sm text-[var(--mm-mist)]">
-                      {recommendation.priorityReasoning.map((reason) => (
-                        <p key={reason}>- {reason}</p>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="rounded-xl border border-[var(--mm-border)] bg-[rgba(8,11,18,0.42)] p-3">
-                    <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
-                      Suggested owner
+                  <div className="max-w-3xl">
+                    <p className="text-[10px] uppercase tracking-[0.08em] text-[var(--mm-teal)]">
+                      Report {index + 1}
                     </p>
                     <p className="mt-2 text-sm font-semibold text-[var(--mm-bone)]">
-                      {recommendation.suggestedOwner?.name ?? "No confident owner suggestion"}
+                      {recommendation.rawReport}
                     </p>
-                    <div className="mt-2 flex flex-col gap-2 text-sm text-[var(--mm-mist)]">
-                      {recommendation.ownerReasoning.map((reason) => (
-                        <p key={reason}>- {reason}</p>
-                      ))}
+                  </div>
+                  <span className="rounded-full border border-[var(--mm-border)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
+                    Confidence {(recommendation.confidence * 100).toFixed(0)}%
+                  </span>
+                </div>
+
+                <div className="mt-4 rounded-2xl border border-[var(--mm-border)] bg-[rgba(8,11,18,0.58)] p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="text-[10px] uppercase tracking-[0.08em] text-[var(--mm-mist)]">
+                        Recommended next move
+                      </p>
+                      <p className="mt-2 text-lg font-semibold text-[var(--mm-bone)]">
+                        {recommendedActionLabel(recommendation.recommendedAction)}
+                        {recommendation.recommendedTargetTicket?.id
+                          ? ` with #${recommendation.recommendedTargetTicket.id}`
+                          : ""}
+                      </p>
+                      {recommendation.recommendedTargetTicket ? (
+                        <p className="mt-1 text-sm text-[var(--mm-mist)]">
+                          {recommendation.recommendedTargetTicket.title}
+                          {recommendation.recommendedTargetTicket.status
+                            ? ` • ${recommendation.recommendedTargetTicket.status}`
+                            : ""}
+                        </p>
+                      ) : null}
+                    </div>
+                    <span
+                      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] ${duplicateRiskBadgeClass(recommendation.duplicateRisk)}`}
+                    >
+                      {recommendation.duplicateRisk} duplicate risk
+                    </span>
+                  </div>
+
+                  <p className="mt-3 text-sm text-[var(--mm-mist)]">
+                    {insightPreview(recommendation.recommendedActionReasoning)}
+                  </p>
+
+                  <div className="mt-4 grid gap-3 md:grid-cols-3">
+                    <div className="rounded-xl border border-[var(--mm-border)] bg-[rgba(255,255,255,0.03)] p-3">
+                      <p className="text-[10px] uppercase tracking-[0.08em] text-[var(--mm-mist)]">
+                        Priority
+                      </p>
+                      <div className="mt-2 flex items-center gap-2">
+                        <span
+                          className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] ${priorityBadgeClass(recommendation.priority)}`}
+                        >
+                          {recommendation.priority}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-sm text-[var(--mm-mist)]">
+                        {insightPreview(recommendation.priorityReasoning)}
+                      </p>
+                    </div>
+                    <div className="rounded-xl border border-[var(--mm-border)] bg-[rgba(255,255,255,0.03)] p-3">
+                      <p className="text-[10px] uppercase tracking-[0.08em] text-[var(--mm-mist)]">
+                        Owner
+                      </p>
+                      <p className="mt-2 text-sm font-semibold text-[var(--mm-bone)]">
+                        {recommendation.suggestedOwner?.name ?? "No confident owner suggestion"}
+                      </p>
+                      <p className="mt-2 text-sm text-[var(--mm-mist)]">
+                        {insightPreview(recommendation.ownerReasoning)}
+                      </p>
+                    </div>
+                    <div className="rounded-xl border border-[var(--mm-border)] bg-[rgba(255,255,255,0.03)] p-3">
+                      <p className="text-[10px] uppercase tracking-[0.08em] text-[var(--mm-mist)]">
+                        Effort
+                      </p>
+                      <div className="mt-2 flex items-center gap-2">
+                        <span
+                          className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] ${effortBadgeClass(recommendation.effortEstimate)}`}
+                        >
+                          {recommendation.effortEstimate}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-sm text-[var(--mm-mist)]">
+                        {insightPreview(recommendation.effortReasoning)}
+                      </p>
                     </div>
                   </div>
-                  <div className="rounded-xl border border-[var(--mm-border)] bg-[rgba(8,11,18,0.42)] p-3">
-                    <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--mm-mist)]">
-                      Effort and memory
-                    </p>
-                    <div className="mt-2 flex flex-col gap-2 text-sm text-[var(--mm-mist)]">
-                      {recommendation.effortReasoning.map((reason) => (
-                        <p key={reason}>- {reason}</p>
-                      ))}
-                    </div>
-                    {recommendation.matchedPastTickets.length > 0 ? (
-                      <div className="mt-3 flex flex-col gap-2">
-                        {recommendation.matchedPastTickets.map((ticket) => (
-                          <div
-                            key={`${ticket.id ?? ticket.title}-${ticket.similarityReason}`}
-                            className="rounded-lg border border-[var(--mm-border)] bg-[rgba(255,255,255,0.02)] px-3 py-2"
-                          >
-                            <p className="text-sm font-semibold text-[var(--mm-bone)]">
-                              {ticket.id ? `#${ticket.id} - ` : ""}
-                              {ticket.title}
-                            </p>
-                            <p className="mt-1 text-xs text-[var(--mm-mist)]">
-                              {ticket.similarityReason}
-                            </p>
-                          </div>
+
+                  <div className="mt-4 grid gap-3 lg:grid-cols-2">
+                    <details className="rounded-xl border border-[var(--mm-border)] bg-[rgba(255,255,255,0.03)] p-3">
+                      <summary className="cursor-pointer list-none text-sm font-semibold text-[var(--mm-bone)]">
+                        Why this recommendation
+                      </summary>
+                      <div className="mt-3 flex flex-col gap-2 text-sm text-[var(--mm-mist)]">
+                        {(recommendation.recommendedActionReasoning ?? []).map((reason) => (
+                          <p key={reason}>- {reason}</p>
                         ))}
                       </div>
-                    ) : (
-                      <p className="mt-3 text-xs text-[var(--mm-mist)]">
-                        No strong historical matches were found.
-                      </p>
-                    )}
+                    </details>
+                    <details className="rounded-xl border border-[var(--mm-border)] bg-[rgba(255,255,255,0.03)] p-3">
+                      <summary className="cursor-pointer list-none text-sm font-semibold text-[var(--mm-bone)]">
+                        Owner and priority details
+                      </summary>
+                      <div className="mt-3 grid gap-4 md:grid-cols-2">
+                        <div className="flex flex-col gap-2 text-sm text-[var(--mm-mist)]">
+                          {(recommendation.priorityReasoning ?? []).map((reason) => (
+                            <p key={reason}>- {reason}</p>
+                          ))}
+                        </div>
+                        <div className="flex flex-col gap-2 text-sm text-[var(--mm-mist)]">
+                          {(recommendation.ownerReasoning ?? []).map((reason) => (
+                            <p key={reason}>- {reason}</p>
+                          ))}
+                        </div>
+                      </div>
+                    </details>
+                    <details className="rounded-xl border border-[var(--mm-border)] bg-[rgba(255,255,255,0.03)] p-3 lg:col-span-2">
+                      <summary className="cursor-pointer list-none text-sm font-semibold text-[var(--mm-bone)]">
+                        Historical memory and effort
+                      </summary>
+                      <div className="mt-3 grid gap-4 lg:grid-cols-[0.8fr_1.2fr]">
+                        <div className="flex flex-col gap-2 text-sm text-[var(--mm-mist)]">
+                          {(recommendation.effortReasoning ?? []).map((reason) => (
+                            <p key={reason}>- {reason}</p>
+                          ))}
+                        </div>
+                        {recommendation.matchedPastTickets.length > 0 ? (
+                          <div className="flex flex-col gap-2">
+                            {recommendation.matchedPastTickets.map((ticket) => (
+                              <div
+                                key={`${ticket.id ?? ticket.title}-${ticket.similarityReason}`}
+                                className="rounded-lg border border-[var(--mm-border)] bg-[rgba(255,255,255,0.02)] px-3 py-2"
+                              >
+                                <p className="text-sm font-semibold text-[var(--mm-bone)]">
+                                  {ticket.id ? `#${ticket.id} - ` : ""}
+                                  {ticket.title}
+                                </p>
+                                <p className="mt-1 text-xs text-[var(--mm-mist)]">
+                                  {ticket.similarityReason}
+                                </p>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-xs text-[var(--mm-mist)]">
+                            No strong historical matches were found.
+                          </p>
+                        )}
+                      </div>
+                    </details>
                   </div>
                 </div>
               </div>

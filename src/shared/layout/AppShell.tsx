@@ -8,6 +8,7 @@ import { ArrowRight, CheckCircle2, Clock3, PauseCircle } from "lucide-react";
 import Sidebar, { NavItem } from "@/shared/layout/Sidebar";
 import Topbar from "@/shared/layout/Topbar";
 import { useAuth } from "@/features/auth/store/useAuth";
+import { ToastProvider } from "@/shared/ui/toast";
 
 const appNav: NavItem[] = [
   { label: "Overview", href: "/app", hint: "Live" },
@@ -74,66 +75,68 @@ export default function AppShell({
   }, [pathname]);
 
   return (
-    <div className="mm-shell">
-      <div className="mm-frame">
-        <div className={`mm-sidebar ${navOpen ? "is-open" : ""}`}>
-          <Sidebar
-            title={shellTitle}
-            subtitle={shellSubtitle}
-            items={items}
-            activePath={pathname}
-            onNavigate={() => setNavOpen(false)}
-          />
-        </div>
-
-        {navOpen ? (
-          <button
-            type="button"
-            className="mm-scrim"
-            aria-label="Close navigation"
-            onClick={() => setNavOpen(false)}
-          />
-        ) : null}
-
-        <div className="mm-content">
-          <Topbar
-            title={title}
-            subtitle={subtitle}
-            onToggleNav={() => setNavOpen(true)}
-          />
-          <main className="mm-panel mm-main-panel">{children}</main>
-        </div>
-
-        <aside className="mm-context-rail">
-          <div className="mm-panel mm-context-card">
-            <p className="mm-context-label">Quick Actions</p>
-            <h3 className="mm-context-title">Move work forward</h3>
-            {shortcuts.map((shortcut) => (
-              <Link key={shortcut.href} href={shortcut.href} className="mm-context-link">
-                <span>{shortcut.label}</span>
-                <ArrowRight className="h-3.5 w-3.5" />
-              </Link>
-            ))}
+    <ToastProvider>
+      <div className="mm-shell">
+        <div className="mm-frame">
+          <div className={`mm-sidebar ${navOpen ? "is-open" : ""}`}>
+            <Sidebar
+              title={shellTitle}
+              subtitle={shellSubtitle}
+              items={items}
+              activePath={pathname}
+              onNavigate={() => setNavOpen(false)}
+            />
           </div>
 
-          <div className="mm-panel mm-context-card">
-            <p className="mm-context-label">Agent Queue</p>
-            <h3 className="mm-context-title">Execution states</h3>
-            <div className="mm-context-state">
-              <span className="flex items-center gap-2"><Clock3 className="h-3.5 w-3.5" />Queued</span>
-              <strong>Live</strong>
-            </div>
-            <div className="mm-context-state">
-              <span className="flex items-center gap-2"><PauseCircle className="h-3.5 w-3.5" />Needs review</span>
-              <strong>Live</strong>
-            </div>
-            <div className="mm-context-state">
-              <span className="flex items-center gap-2"><CheckCircle2 className="h-3.5 w-3.5" />Completed</span>
-              <strong>Live</strong>
-            </div>
+          {navOpen ? (
+            <button
+              type="button"
+              className="mm-scrim"
+              aria-label="Close navigation"
+              onClick={() => setNavOpen(false)}
+            />
+          ) : null}
+
+          <div className="mm-content">
+            <Topbar
+              title={title}
+              subtitle={subtitle}
+              onToggleNav={() => setNavOpen(true)}
+            />
+            <main className="mm-panel mm-main-panel">{children}</main>
           </div>
-        </aside>
+
+          <aside className="mm-context-rail">
+            <div className="mm-panel mm-context-card">
+              <p className="mm-context-label">Quick Actions</p>
+              <h3 className="mm-context-title">Move work forward</h3>
+              {shortcuts.map((shortcut) => (
+                <Link key={shortcut.href} href={shortcut.href} className="mm-context-link">
+                  <span>{shortcut.label}</span>
+                  <ArrowRight className="h-3.5 w-3.5" />
+                </Link>
+              ))}
+            </div>
+
+            <div className="mm-panel mm-context-card">
+              <p className="mm-context-label">Agent Queue</p>
+              <h3 className="mm-context-title">Execution states</h3>
+              <div className="mm-context-state">
+                <span className="flex items-center gap-2"><Clock3 className="h-3.5 w-3.5" />Queued</span>
+                <strong>Live</strong>
+              </div>
+              <div className="mm-context-state">
+                <span className="flex items-center gap-2"><PauseCircle className="h-3.5 w-3.5" />Needs review</span>
+                <strong>Live</strong>
+              </div>
+              <div className="mm-context-state">
+                <span className="flex items-center gap-2"><CheckCircle2 className="h-3.5 w-3.5" />Completed</span>
+                <strong>Live</strong>
+              </div>
+            </div>
+          </aside>
+        </div>
       </div>
-    </div>
+    </ToastProvider>
   );
 }
